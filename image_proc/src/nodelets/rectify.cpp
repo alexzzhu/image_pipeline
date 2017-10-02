@@ -43,6 +43,8 @@
 #include <cv_bridge/cv_bridge.h>
 #include <dynamic_reconfigure/server.h>
 #include <image_proc/RectifyConfig.h>
+#include <camera_info_manager/camera_info_manager.h>
+#include <sensor_msgs/CameraInfo.h>
 
 namespace image_proc {
 
@@ -51,7 +53,11 @@ class RectifyNodelet : public nodelet::Nodelet
   // ROS communication
   boost::shared_ptr<image_transport::ImageTransport> it_;
   image_transport::CameraSubscriber sub_camera_;
+  ros::Subscriber sub_image_;
   int queue_size_;
+  bool cam_info_set_ = false;
+
+  ros::NodeHandle nh_;
   
   boost::mutex connect_mutex_;
   image_transport::Publisher pub_rect_;
@@ -79,12 +85,28 @@ class RectifyNodelet : public nodelet::Nodelet
 void RectifyNodelet::onInit()
 {
   ros::NodeHandle &nh         = getNodeHandle();
+  nh_ = nh;
   ros::NodeHandle &private_nh = getPrivateNodeHandle();
   it_.reset(new image_transport::ImageTransport(nh));
 
+  std::string cam_info_url;
   // Read parameters
   private_nh.param("queue_size", queue_size_, 5);
+  private_nh.param<std::string>("cam_info_url", cam_info_url, "");
 
+  std::cout << "Cam info url: " << cam_info_url << std::endl;
+  if (!cam_info_url.empty()) {
+    camera_info_manager::CameraInfoManager cam_info_manager(nh);
+    if (cam_info_manager.validateURL(cam_info_url)) {
+      cam_info_manager.loadCameraInfo(cam_info_url);
+      sensor_msgs::CameraInfo cam_info = cam_info_manager.getCameraInfo();
+      model_.fromCameraInfo(cam_info);
+      cam_info_set_ = true;
+    } else {
+      ROS_WARN("Error, cam info not found at %s", cam_info_url.c_str());
+    }
+  }
+  
   // Set up dynamic reconfigure
   reconfigure_server_.reset(new ReconfigureServer(config_mutex_, private_nh));
   ReconfigureServer::CallbackType f = boost::bind(&RectifyNodelet::configCb, this, _1, _2);
@@ -105,8 +127,18 @@ void RectifyNodelet::connectCb()
     sub_camera_.shutdown();
   else if (!sub_camera_)
   {
-    image_transport::TransportHints hints("raw", ros::TransportHints(), getPrivateNodeHandle());
-    sub_camera_ = it_->subscribeCamera("image_mono", queue_size_, &RectifyNodelet::imageCb, this, hints);
+    if (cam_info_set_) {
+      // If cam_info_set_, this won't actually be used.
+      sensor_msgs::CameraInfoConstPtr cam_info_empty(new sensor_msgs::CameraInfo());
+      sub_image_ = nh_.subscribe<sensor_msgs::Image>
+        ("image_mono",
+         queue_size_,
+         boost::bind(&RectifyNodelet::imageCb, this, _1, cam_info_empty));
+    } else {
+      image_transport::TransportHints hints("raw", ros::TransportHints(), getPrivateNodeHandle());
+      sub_camera_ = it_->subscribeCamera("image_mono", queue_size_, &RectifyNodelet::imageCb, this, hints);
+    }
+    
   }
 }
 
@@ -114,32 +146,36 @@ void RectifyNodelet::imageCb(const sensor_msgs::ImageConstPtr& image_msg,
                              const sensor_msgs::CameraInfoConstPtr& info_msg)
 {
   // Verify camera is actually calibrated
-  if (info_msg->K[0] == 0.0) {
+  if (!cam_info_set_ && info_msg->K[0] == 0.0) {
     NODELET_ERROR_THROTTLE(30, "Rectified topic '%s' requested but camera publishing '%s' "
                            "is uncalibrated", pub_rect_.getTopic().c_str(),
                            sub_camera_.getInfoTopic().c_str());
     return;
   }
 
-  // If zero distortion, just pass the message along
-  bool zero_distortion = true;
-  for (size_t i = 0; i < info_msg->D.size(); ++i)
-  {
-    if (info_msg->D[i] != 0.0)
+  if (!cam_info_set_) {
+    // If zero distortion, just pass the message along
+    bool zero_distortion = true;
+    for (size_t i = 0; i < info_msg->D.size(); ++i)
     {
-      zero_distortion = false;
-      break;
+      if (info_msg->D[i] != 0.0)
+      {
+        zero_distortion = false;
+        break;
+      }
+    }
+    // This will be true if D is empty/zero sized
+    if (zero_distortion)
+    {
+      pub_rect_.publish(image_msg);
+      return;
     }
   }
-  // This will be true if D is empty/zero sized
-  if (zero_distortion)
-  {
-    pub_rect_.publish(image_msg);
-    return;
-  }
 
-  // Update the camera model
-  model_.fromCameraInfo(info_msg);
+  if (!cam_info_set_) {
+    // Update the camera model
+    model_.fromCameraInfo(info_msg);
+  }
   
   // Create cv::Mat views onto both buffers
   const cv::Mat image = cv_bridge::toCvShare(image_msg)->image;

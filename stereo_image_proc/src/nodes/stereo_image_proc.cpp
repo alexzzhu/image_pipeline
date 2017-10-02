@@ -101,18 +101,31 @@ int main(int argc, char **argv)
 
   // Shared parameters to be propagated to nodelet private namespaces
   ros::NodeHandle private_nh("~");
-  XmlRpc::XmlRpcValue shared_params;
+  XmlRpc::XmlRpcValue shared_params, left_params, right_params;
   int queue_size;
-  if (private_nh.getParam("queue_size", queue_size))
+  if (private_nh.getParam("queue_size", queue_size)) {
     shared_params["queue_size"] = queue_size;
+    left_params["queue_size"] = queue_size;
+    right_params["queue_size"] = queue_size;
+  }
+
+  std::string left_cam_info_url;
+  if (private_nh.getParam("left_cam_info_url", left_cam_info_url)) {
+    left_params["cam_info_url"] = left_cam_info_url;
+  }
+
+  std::string right_cam_info_url;
+  if (private_nh.getParam("right_cam_info_url", right_cam_info_url)) {
+    right_params["cam_info_url"] = right_cam_info_url;
+  }
 
   nodelet::Loader manager(false); // Don't bring up the manager ROS API
   nodelet::M_string remappings;
   nodelet::V_string my_argv;
 
   // Load equivalents of image_proc for left and right cameras
-  loadMonocularNodelets(manager, "left",  shared_params, my_argv);
-  loadMonocularNodelets(manager, "right", shared_params, my_argv);
+  loadMonocularNodelets(manager, "left",  left_params, my_argv);
+  loadMonocularNodelets(manager, "right", right_params, my_argv);
 
   // Stereo nodelets also need to know the synchronization policy
   bool approx_sync;
